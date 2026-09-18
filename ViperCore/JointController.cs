@@ -1,111 +1,422 @@
+using System.Diagnostics;
+using System.Runtime.InteropServices;
+
 namespace ViperCore
 {
     /// <summary>
-    /// Closed-loop joint controller for ViperDevice.
-    /// Mirrors GeomagicCore's JointController: pluggable IController + ITrajectory,
-    /// driven by a periodic timer. Instead of setTorques, applies SetJointAngles.
+    /// Closed-loop joint controller for <see cref="ViperDevice"/>: a periodic
+    /// loop that reads the arm, evaluates the trajectory, runs the controller
+    /// and writes the goals.
+    ///
+    /// <para><b>It is the only thing that talks to the bus while running.</b>
+    /// Each tick costs two transactions — one sync read, one sync write —
+    /// regardless of joint count. Anyone else who needs the arm's state reads
+    /// <see cref="ViperDevice.LatestState"/>, which is the snapshot this loop
+    /// publishes and touches no hardware. Two callers issuing transactions on
+    /// one serial port read each other's replies.</para>
+    ///
+    /// <para><b>The operating mode follows the controller.</b>
+    /// <see cref="SetController"/> applies <see cref="IController.RequiredMode"/>,
+    /// which needs torque off (EEPROM) and therefore has to happen before the
+    /// motion starts, not during it.</para>
+    ///
+    /// <para><b>Timing.</b> The loop owns a dedicated thread rather than a
+    /// <c>System.Threading.Timer</c>: a pool timer inherits Windows' ~15 ms
+    /// scheduling granularity, which is coarser than the period itself at any
+    /// rate worth running. The thread raises the system timer resolution while
+    /// it runs and spins out the last stretch of each period. What it actually
+    /// achieved is reported in <see cref="ActualRateHz"/> — a requested period
+    /// the bus cannot sustain is silently the requested period no longer, and
+    /// that shows up as motion in visible steps.</para>
     /// </summary>
     public sealed class JointController : IDisposable
     {
+        // Windows' default scheduler granularity is ~15.6 ms, so Thread.Sleep(1)
+        // really sleeps about 15. Asking for 1 ms makes the coarse part of the
+        // wait usable and leaves only the last stretch to the spin.
+        [DllImport("winmm.dll", EntryPoint = "timeBeginPeriod")]
+        private static extern uint TimeBeginPeriod(uint ms);
+
+        [DllImport("winmm.dll", EntryPoint = "timeEndPeriod")]
+        private static extern uint TimeEndPeriod(uint ms);
+
+        /// <summary>Above this much time left in the period, sleep; below it, spin.</summary>
+        private const double SpinThresholdSeconds = 0.003;
+
         private readonly ViperDevice _device;
-        private readonly double      _sampleTime;
+        private readonly double      _period;
 
         private IController? _ctrl;
         private ITrajectory? _traj;
 
-        private System.Threading.Timer? _timer;
-        private int  _tickRunning;   // Interlocked flag — prevents concurrent ticks
+        private Thread?       _thread;
+        private volatile bool _stop;
 
-        private double[]  _qf        = [];
-        private double    _tf;
-        private DateTime  _tStart;
-        private bool      _firstTick;
-        private bool      _completed;
+        private double[] _qf = [];
+        private double   _tf;
+        private bool     _completed;
+        private bool     _firstTick;
+        private double   _tPrevTick;
 
-        public bool IsRunning   => _timer != null;
+        /// <summary>
+        /// Loop time at which the trajectory was initialised. Everything the
+        /// trajectory and the controller see is measured from here.
+        /// </summary>
+        private double _tOffset;
+
+        // Every per-tick buffer is allocated once, in MoveTo. At 1 kHz a fresh
+        // set each tick would be six thousand short-lived arrays a second, and
+        // the GC pauses land inside the control loop.
+        private double[]      _qpp    = [];
+        private double[]      _qd     = [];
+        private double[]      _qpd    = [];
+        private double[]      _qppd   = [];
+        private double[]      _output = [];
+        private ControlInput? _input;
+
+        // Acceleration is differentiated from the MEASURED velocity, so this is
+        // one differentiation of a clean signal rather than two of a quantised
+        // position. The first-order filter keeps the step-to-step noise of the
+        // velocity register out of the result.
+        private double[] _qpPrev  = [];
+        private double[] _qppFilt = [];
+
+        /// <summary>Corner of the acceleration filter, rad/s. Zero disables it.</summary>
+        public double AccelerationFilter { get; set; } = 30.0;
+
+        /// <summary>
+        /// Seconds to keep ticking after the trajectory ends, holding its final
+        /// point. Zero stops the instant the reference arrives.
+        ///
+        /// <para><b>The reference arriving is not the arm arriving.</b> A
+        /// position servo trails its setpoint by roughly velocity over gain, so
+        /// at <c>tf</c> the arm is still short by whatever it was lagging. Cut
+        /// the loop there and the motion reports completed with the arm degrees
+        /// away, and the tracking error never gets the chance to close.</para>
+        ///
+        /// <para>It also separates the two reasons an error stays open: over
+        /// this window a lag decays to zero, while a load the joint cannot hold
+        /// — gravity, stiction — settles on a constant offset and stays there.
+        /// The value it settles at is that load, measured.</para>
+        /// </summary>
+        public double SettleTime { get; set; } = 0.5;
+
+        /// <summary>Ticks executed in the current motion, failed reads included.</summary>
+        public long TickCount { get; private set; }
+
+        /// <summary>
+        /// Ticks of the current motion that failed to read or write. A bus
+        /// dropping packets advances the trajectory while the arm stops getting
+        /// setpoints, which deforms the tracking error with nothing to show for
+        /// it — so it is counted rather than only reported one at a time.
+        /// </summary>
+        public long FaultCount { get; private set; }
+
+        public bool IsRunning   => _thread is { IsAlive: true };
         public bool IsCompleted => _completed;
 
-        /// <param name="sampleTime">Timer period in seconds (default 50 ms).</param>
+        /// <summary>Period this loop was asked for, in seconds.</summary>
+        public double RequestedPeriod => _period;
+
+        /// <summary>
+        /// Rate the loop is actually achieving, in Hz, smoothed over recent
+        /// ticks. Zero before the first two ticks of a motion.
+        ///
+        /// <para>Worth reading rather than assuming: the requested period is a
+        /// floor, and two serial transactions over USB do not always fit inside
+        /// it. When they do not, the loop falls back to the rate the bus allows
+        /// and the setpoints it streams get further apart.</para>
+        /// </summary>
+        public double ActualRateHz { get; private set; }
+
+        /// <summary>
+        /// Longest gap between two consecutive ticks of the current motion, in
+        /// milliseconds. The worst case is what a controller has to survive, and
+        /// it is not visible in the average.
+        /// </summary>
+        public double WorstTickMs { get; private set; }
+
+        /// <summary>Raised when a tick fails to read or write. Fires on the loop thread.</summary>
+        public event Action<string>? Fault;
+
+        /// <summary>
+        /// Raised at the end of every tick with that tick's data, on the loop
+        /// thread.
+        ///
+        /// <para><b>The argument is reused between ticks.</b> A handler must
+        /// copy out whatever it needs before returning, and must return quickly:
+        /// it runs inside the control period.</para>
+        /// </summary>
+        public event Action<ControlInput>? Sampled;
+
+        /// <param name="sampleTime">Loop period in seconds (default 50 ms).</param>
         public JointController(ViperDevice device, double sampleTime = 0.05)
         {
-            _device     = device;
-            _sampleTime = sampleTime;
+            _device = device;
+            _period = sampleTime;
         }
 
-        public void SetController(IController controller) => _ctrl = controller;
+        /// <summary>
+        /// Installs the controller and puts the motors in the mode it requires.
+        /// Leaves torque OFF — <see cref="MoveTo"/> turns it back on — because
+        /// the mode change has to pass through EEPROM and re-enabling early
+        /// would let the arm jump to whatever stale goal the new mode's register
+        /// holds.
+        /// </summary>
+        public bool SetController(IController controller)
+        {
+            _ctrl = controller;
+
+            if (_device.Mode == controller.RequiredMode)
+                return true;
+
+            return _device.SetOperatingMode(controller.RequiredMode);
+        }
+
         public void SetTrajectory(ITrajectory trajectory) => _traj = trajectory;
 
-        /// <summary>Starts a motion to qf (radians) completed in tf seconds.</summary>
-        public void MoveTo(double[] qf, double tf)
+        /// <summary>
+        /// Starts a motion to <paramref name="qf"/> (Dynamixel degrees) over
+        /// <paramref name="tf"/> seconds. Enables torque before the first tick.
+        /// </summary>
+        public bool MoveTo(double[] qf, double tf)
         {
             Stop();
 
+            if (qf.Length != _device.JointCount)
+            {
+                Fault?.Invoke($"MoveTo espera {_device.JointCount} valores, recibió {qf.Length}.");
+                return false;
+            }
+
+            int n = _device.JointCount;
+
             _qf        = (double[])qf.Clone();
             _tf        = tf;
-            _firstTick = true;
             _completed = false;
+            _firstTick = true;
+            _tPrevTick = 0.0;
+            _tOffset   = 0.0;
+
+            _qpPrev  = new double[n];
+            _qppFilt = new double[n];
+            _qpp     = new double[n];
+            _qd      = new double[n];
+            _qpd     = new double[n];
+            _qppd    = new double[n];
+            _output  = new double[n];
+            _input   = new ControlInput();
+
+            ActualRateHz = 0.0;
+            WorstTickMs  = 0.0;
+            TickCount    = 0;
+            FaultCount   = 0;
+
             _ctrl?.Reset();
 
-            int periodMs = (int)(_sampleTime * 1000);
-            _timer = new System.Threading.Timer(Tick, null, 0, periodMs);
+            // Torque comes on holding the present pose, never bare. A plain
+            // EnableTorque would servo every motor to whatever stale Goal
+            // Position its register holds — after any spell with torque off,
+            // the pose from before the arm sagged — and it would do it in the
+            // gap before the first tick writes a real command. With Profile
+            // Velocity at 0 (no limit) that gap is a snap, not a drift.
+            //
+            // The non-position modes have no pose to take hold of: they ignore
+            // Goal Position entirely. Energising them on a stale goal is the
+            // same open problem as EmergencyStop outside the position modes.
+            bool energised = _device.Mode is OperatingMode.Position or
+                                             OperatingMode.ExtendedPosition or
+                                             OperatingMode.CurrentPosition
+                ? _device.EnableTorqueHolding()
+                : _device.EnableTorque(true);
+
+            if (!energised)
+            {
+                Fault?.Invoke(_device.LastError ?? "No se pudo habilitar el par.");
+                return false;
+            }
+
+            _stop   = false;
+            _thread = new Thread(RunLoop)
+            {
+                IsBackground = true,
+                Name         = "ViperControlLoop",
+                // Above normal, not highest: this loop spins, and starving the
+                // UI thread it reports to helps nobody.
+                Priority     = ThreadPriority.AboveNormal,
+            };
+            _thread.Start();
+            return true;
         }
 
+        /// <summary>
+        /// Stops ticking. Leaves torque as it is, so the arm holds its last
+        /// commanded pose rather than dropping. To stop and freeze deliberately
+        /// use <see cref="ViperDevice.EmergencyStop"/>.
+        /// </summary>
         public void Stop()
         {
-            _timer?.Dispose();
-            _timer = null;
+            Thread? t = _thread;
+            _stop   = true;
+            _thread = null;
+
+            // A tick that finished the trajectory calls Stop on the loop thread
+            // itself; joining there would deadlock.
+            if (t != null && t != Thread.CurrentThread && t.IsAlive)
+                t.Join(500);
         }
 
-        private void Tick(object? _)
+        // ── The loop ─────────────────────────────────────────────────────────
+
+        private void RunLoop()
         {
-            // Skip tick if a previous one is still executing (serial I/O takes ~24 ms).
-            if (Interlocked.CompareExchange(ref _tickRunning, 1, 0) != 0) return;
+            TimeBeginPeriod(1);
+            var clock = Stopwatch.StartNew();
 
             try
             {
-                double[] q = _device.GetJointAngles();
+                double tStart   = clock.Elapsed.TotalSeconds;
+                double nextTick = tStart;
+                double prevTick = double.NaN;
 
-                if (_firstTick)
+                while (!_stop)
                 {
-                    _tStart    = DateTime.UtcNow;
-                    _traj?.Init(q, _qf, _tf);
-                    _firstTick = false;
-                }
+                    double now = clock.Elapsed.TotalSeconds;
 
-                double t  = (DateTime.UtcNow - _tStart).TotalSeconds;
-                int    n  = q.Length;
+                    if (!double.IsNaN(prevTick))
+                    {
+                        double spacing = now - prevTick;
+                        WorstTickMs = Math.Max(WorstTickMs, spacing * 1000.0);
 
-                double[] qd = new double[n];
-                _traj?.Evaluate(t, qd);
+                        // Exponential mean over roughly the last twenty ticks,
+                        // so the number settles quickly but does not chase a
+                        // single late tick.
+                        double hz = spacing > 0.0 ? 1.0 / spacing : 0.0;
+                        ActualRateHz = ActualRateHz <= 0.0
+                            ? hz
+                            : ActualRateHz + 0.1 * (hz - ActualRateHz);
+                    }
+                    prevTick = now;
 
-                var input = new ControlInput
-                {
-                    Q    = q,
-                    Qd   = qd,
-                    Qpf  = new double[n],
-                    Qppf = new double[n],
-                    T    = t,
-                    Dt   = _sampleTime
-                };
+                    Tick(now - tStart);
 
-                double[] output = new double[n];
-                if (_ctrl != null)
-                    _ctrl.Compute(input, output);
-                else
-                    Array.Copy(qd, output, n);
+                    if (_stop) break;
 
-                _device.SetJointAngles(output);
+                    nextTick += _period;
+                    double after = clock.Elapsed.TotalSeconds;
 
-                if (!_completed && t >= _tf)
-                {
-                    _completed = true;
-                    Stop();
+                    // Behind schedule: resync instead of firing the backlog
+                    // back to back. Bunched ticks would put transactions on the
+                    // bus faster than it can carry them and buy nothing.
+                    if (after >= nextTick) nextTick = after;
+                    else WaitUntil(clock, nextTick);
                 }
             }
             finally
             {
-                Interlocked.Exchange(ref _tickRunning, 0);
+                TimeEndPeriod(1);
             }
+        }
+
+        private void WaitUntil(Stopwatch clock, double until)
+        {
+            while (!_stop)
+            {
+                double remaining = until - clock.Elapsed.TotalSeconds;
+                if (remaining <= 0.0) return;
+
+                if (remaining > SpinThresholdSeconds) Thread.Sleep(1);
+                else Thread.SpinWait(100);
+            }
+        }
+
+        private void Tick(double t)
+        {
+            TickCount++;
+
+            JointState s = _device.ReadState();
+            if (!s.Valid)
+            {
+                // A dropped read is not a reason to stop: the arm holds its last
+                // goal and the next tick usually succeeds. Skipping keeps the
+                // controller from working on stale measurements.
+                RaiseFault(_device.LastError ?? "Lectura fallida.");
+                return;
+            }
+
+            int n = s.Count;
+
+            if (_firstTick)
+            {
+                // The trajectory starts from wherever the arm actually is, so
+                // its first setpoint is a no-op and nothing jumps.
+                //
+                // Its clock starts here too, not when the loop did. The two are
+                // the same tick when the first read succeeds — but a read that
+                // fails is skipped, and without this offset the trajectory would
+                // be initialised at the present pose and then immediately asked
+                // for its value at a time that had already elapsed, which is a
+                // step the arm has to chase.
+                _traj?.Init(s.Position, _qf, _tf);
+                Array.Copy(s.Velocity, _qpPrev, n);
+                _tOffset   = t;
+                _tPrevTick = t;
+                _firstTick = false;
+            }
+
+            double dt = t - _tPrevTick;
+            if (dt <= 0.0) dt = _period;
+            _tPrevTick = t;
+
+            double tTraj = t - _tOffset;
+
+            // Acceleration from the measured velocity, low-passed.
+            double lam = AccelerationFilter;
+            for (int i = 0; i < n; i++)
+            {
+                double raw = (s.Velocity[i] - _qpPrev[i]) / dt;
+                if (lam > 0.0)
+                {
+                    _qppFilt[i] += lam * (raw - _qppFilt[i]) * dt;
+                    _qpp[i] = _qppFilt[i];
+                }
+                else
+                {
+                    _qpp[i] = raw;
+                }
+                _qpPrev[i] = s.Velocity[i];
+            }
+
+            _traj?.Evaluate(tTraj, _qd, _qpd, _qppd);
+
+            ControlInput input = _input!;
+            input.Q    = s.Position; input.Qp  = s.Velocity; input.Qpp = _qpp;
+            input.Current = s.Current;
+            input.Qd   = _qd;        input.Qpd = _qpd;       input.Qppd = _qppd;
+            input.T    = tTraj;      input.Dt  = dt;
+
+            if (_ctrl != null) _ctrl.Compute(input, _output);
+            else               Array.Copy(_qd, _output, n);
+
+            if (!_device.WriteGoals(_output))
+                RaiseFault(_device.LastError ?? "Escritura fallida.");
+
+            Sampled?.Invoke(input);
+
+            // The trajectory is done at tf; the arm is not. SettleTime keeps the
+            // loop holding qf long enough for the tracking error to close, or to
+            // show that it does not.
+            if (!_completed && tTraj >= _tf + SettleTime)
+            {
+                _completed = true;
+                _stop      = true;
+            }
+        }
+
+        private void RaiseFault(string message)
+        {
+            FaultCount++;
+            Fault?.Invoke(message);
         }
 
         public void Dispose() => Stop();
