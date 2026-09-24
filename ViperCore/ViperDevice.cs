@@ -687,11 +687,24 @@ namespace ViperCore
         /// instead of dropping, which is what a stop should do on a machine with
         /// no brakes.
         ///
-        /// <para><b>Only valid in the position modes</b> (Position,
-        /// ExtendedPosition, CurrentPosition). The other modes ignore Goal
-        /// Position, and switching mode would need torque off — a brief drop —
-        /// so this refuses instead of pretending to have stopped. Returns false
-        /// and sets <see cref="LastError"/> in that case.</para>
+        /// <para><b>Fuera de los modos de posición vuelve a modo posición.</b>
+        /// Corriente, velocidad y PWM ignoran <c>Goal Position</c>, así que ahí no
+        /// hay pose que sujetar: reescribirla no detendría nada. La secuencia es
+        /// par off → modo posición → <see cref="EnableTorqueHolding"/>, y sí
+        /// cuesta una caída breve mientras el par está apagado — el cambio de modo
+        /// vive en EEPROM y no admite otra cosa.</para>
+        ///
+        /// <para>Esa caída es el precio de que el paro <b>sostenga de verdad</b>.
+        /// La alternativa que se probó primero —escribir la corriente de gravedad
+        /// y dejar el brazo flotando— <b>no es un paro</b>: es lazo abierto, sólo
+        /// equilibra en la pose exacta donde se calculó, y si se mueve el brazo
+        /// con la mano esa corriente constante deja de corresponder y puede
+        /// empujarlo. Un paro no puede depender de que haya un lazo corriendo.</para>
+        ///
+        /// <para>Se sujeta donde el brazo <b>queda</b> tras la caída, no donde
+        /// estaba: <see cref="EnableTorqueHolding"/> lee la pose fresca. Mandarlo
+        /// de vuelta a la de antes sería comandar un movimiento, que es lo
+        /// contrario de detenerse.</para>
         /// </summary>
         public bool EmergencyStop()
         {
@@ -702,19 +715,35 @@ namespace ViperCore
             // it has already left.
             lock (_io)
             {
-                if (Mode is not (OperatingMode.Position or
-                                 OperatingMode.ExtendedPosition or
-                                 OperatingMode.CurrentPosition))
+                if (Mode is OperatingMode.Position or
+                            OperatingMode.ExtendedPosition or
+                            OperatingMode.CurrentPosition)
                 {
-                    return Fail($"El paro de emergencia sólo está implementado para los modos de " +
-                                $"posición; el modo actual es {Mode}.");
+                    JointState s = ReadState();
+                    if (!s.Valid)
+                        return Fail("Paro de emergencia: no se pudo leer la posición actual.");
+
+                    return WriteGoals(s.Position);
                 }
 
-                JointState s = ReadState();
-                if (!s.Valid)
-                    return Fail("Paro de emergencia: no se pudo leer la posición actual.");
+                // Antes de soltar el par, quitar el mando que el brazo esté
+                // siguiendo. En corriente eso es corriente cero; si no, el motor
+                // conserva la última meta escrita durante todo el cambio de modo.
+                if (Mode == OperatingMode.Current && !WriteGoals(new double[JointCount]))
+                    return Fail("Paro de emergencia: no se pudo poner la corriente a cero. " +
+                                Environment.NewLine + LastError);
 
-                return WriteGoals(s.Position);
+                if (!SetOperatingMode(OperatingMode.Position))
+                    return Fail("Paro de emergencia: no se pudo volver a modo posición. " +
+                                Environment.NewLine + LastError);
+
+                // SetOperatingMode deja el par apagado a propósito (§4.1), así
+                // que el brazo está cayendo desde aquí hasta la línea siguiente.
+                if (!EnableTorqueHolding())
+                    return Fail("Paro de emergencia: se volvió a modo posición pero " +
+                                "no se pudo sujetar la pose. " + Environment.NewLine + LastError);
+
+                return true;
             }
         }
 

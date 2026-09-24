@@ -1,0 +1,23 @@
+# Visual Studio
+.vs/
+*.user
+*.suo
+*.userosscache
+*.sln.docstates
+
+# Salida de compilación
+bin/
+obj/
+
+# NuGet
+*.nupkg
+project.lock.json
+project.nuget.cache
+packages/
+
+# ── Nota sobre las DLL ───────────────────────────────────────────────────────
+#
+# A diferencia de RobotClient, aquí NO se ignora *.dll en general:
+# ViperCore/dxl_x86_c.dll es el SDK de Dynamixel del que dependen los P/Invoke
+# de DynamixelSDK.cs, vive en el árbol de fuentes y tiene que estar en el repo.
+# Las copias que el build deja en bin/ ya quedan fuera por la regla de arriba.
