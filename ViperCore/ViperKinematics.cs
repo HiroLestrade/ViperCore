@@ -228,9 +228,11 @@ namespace ViperCore
         /// Most hand-typed poses are unreachable, and a silent approximation is
         /// exactly what makes that hard to see.</para>
         ///
-        /// <para><b>Reach is checked; the arm's mechanical joint limits are
-        /// not</b> — they are tighter than a motor's full turn and are not in the
-        /// article's model. See step 5.</para>
+        /// <para><b>Both geometric guards apply</b>: reach, that the wrist centre
+        /// lands inside the shoulder's annulus, and <see cref="ViperJointLimits"/>,
+        /// that every joint the solution asks for is one the linkage allows. What
+        /// neither catches is a self-collision, which is not a per-joint
+        /// interval.</para>
         /// </summary>
         /// <param name="pTip">Tool tip in the base frame, metres.</param>
         /// <param name="r06">Base-to-tool rotation, 3×3, <c>r06[row, col]</c>.</param>
@@ -352,24 +354,39 @@ namespace ViperCore
                 q6 = Math.Atan2(m[1, 2],  m[1, 0]);
             }
 
-            // ── 5. Fold into the motors' range ───────────────────────────────
+            // ── 5. Fold into the motors' range, then test the joint limits ────
             //
-            // A Dynamixel in position mode spans exactly one turn, 0-360, which is
-            // ±π about the centre. So every angle is reachable modulo 2π and
-            // wrapping is not an approximation — 190° and −170° are the same
-            // configuration, and only one of the two is expressible.
+            // A Dynamixel in position mode spans exactly one turn, so every angle
+            // is reachable modulo 2π and folding is not an approximation — 190°
+            // and −170° are the same configuration, and only one of the two is a
+            // command the motor accepts. Which one is not decided by a symmetric
+            // ±180: it depends on where that joint's limits sit, so the fold is
+            // done against them. See ViperJointLimits.Fold.
             //
-            // What this does NOT check is the arm's own mechanical limits, which
-            // are tighter than a full turn on the shoulder and the elbow and are
-            // not in the article's model. A pose that passes here can still be one
-            // the linkage refuses; until those limits are measured, the reach test
-            // above is the only geometric guard there is.
-            qOut[0] = Wrap(q1);
-            qOut[1] = Wrap(q2);
-            qOut[2] = Wrap(q3);
-            qOut[3] = Wrap(q4);
-            qOut[4] = Wrap(q5);
-            qOut[5] = Wrap(q6);
+            // The limits are the guard this function lacked. Reach only says the
+            // wrist centre lands inside the shoulder's annulus; the shoulder, the
+            // elbow and the wrist pitch each stop well short of a full turn, so a
+            // pose can satisfy every test above and still be one the linkage
+            // refuses. Rejecting it here is the same contract as the reach test —
+            // a reason rather than a clamped pose — and it is the last place the
+            // rejection is free, because below this the next step is a motor.
+            Span<double> q = stackalloc double[JointCount];
+            q[0] = q1; q[1] = q2; q[2] = q3; q[3] = q4; q[4] = q5; q[5] = q6;
+
+            for (int i = 0; i < JointCount; i++)
+            {
+                double folded = ViperJointLimits.Fold(i, Wrap(q[i]));
+
+                if (!ViperJointLimits.Contains(i, folded))
+                {
+                    reason = "La pose queda dentro del alcance, pero fuera de los " +
+                             "topes de la articulación." + Environment.NewLine +
+                             Environment.NewLine + ViperJointLimits.Describe(i, folded);
+                    return false;
+                }
+
+                qOut[i] = folded;
+            }
 
             return true;
         }
