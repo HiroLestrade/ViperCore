@@ -247,10 +247,17 @@ namespace ViperCore
         /// snaps to it at whatever Profile Velocity allows. Profile Velocity 0
         /// means <b>no limit</b>, not "stop".</para>
         ///
-        /// <para><b>Only valid in the position modes</b>, for the same reason as
-        /// <see cref="EmergencyStop"/>: the other modes ignore Goal Position, so
-        /// there is no pose to take hold of. Fails explicitly there rather than
-        /// energising the arm on an unknown goal.</para>
+        /// <para><b>En modo corriente no hay pose que sujetar</b> —ese modo ignora
+        /// <c>Goal Position</c>—, así que ahí el equivalente honesto es
+        /// <b>corriente cero</b>: se escribe 0 en las seis y luego se energiza. El
+        /// brazo se queda tan flojo como ya estaba, en vez de dar un tirón contra
+        /// el <c>Goal Current</c> que el registro arrastre de una corrida
+        /// anterior. El primer tick del lazo ya escribe la corriente real.</para>
+        ///
+        /// <para>Velocidad y PWM siguen fallando explícitamente: ahí ni hay pose
+        /// que sujetar ni un cero que signifique "quieto" —cero PWM sí, cero
+        /// velocidad también, pero ninguno de los dos sostiene el brazo, así que
+        /// energizar no es lo que el llamador cree que pide—.</para>
         /// </summary>
         public bool EnableTorqueHolding()
         {
@@ -260,12 +267,23 @@ namespace ViperCore
             {
                 if (!Ready(out _)) return false;
 
+                // Current mode: zero first, then energise. Writing the goal before
+                // the torque is the same ordering the position branch uses, and it
+                // is the whole point — the gap between energising and the first
+                // real command is where a stale register does its damage.
+                if (Mode == OperatingMode.Current)
+                {
+                    if (!WriteGoals(new double[JointCount])) return false;
+                    return EnableTorque(true);
+                }
+
                 if (Mode is not (OperatingMode.Position or
                                  OperatingMode.ExtendedPosition or
                                  OperatingMode.CurrentPosition))
                 {
                     return Fail("Habilitar el par sujetando la pose sólo está implementado " +
-                                $"para los modos de posición; el modo actual es {Mode}.");
+                                "para los modos de posición y corriente; el modo actual es " +
+                                $"{Mode}.");
                 }
 
                 JointState s = ReadState();
@@ -386,22 +404,77 @@ namespace ViperCore
         /// </summary>
         public bool SetCurrentLimit(double milliamps)
         {
-            uint units = (uint)Math.Max(0, Math.Round(milliamps / ControlTable.MilliampsPerCurrentUnit));
+            var same = new double[JointCount];
+            Array.Fill(same, milliamps);
+            return SetCurrentLimit(same);
+        }
+
+        /// <summary>
+        /// El límite de corriente <b>por articulación</b>, en mA. Es la forma que
+        /// conviene: en este brazo el hombro llega a pedir 1563 mA contra la
+        /// gravedad y la muñeca nunca pasa de 127, así que un solo escalar obliga a
+        /// dimensionar por el peor caso y le deja a los motores chicos un techo
+        /// diez veces mayor que cualquier cosa que vayan a necesitar.
+        ///
+        /// <para><b>Deja el par apagado y no lo vuelve a encender</b>, porque
+        /// <c>Current Limit</c> vive en EEPROM igual que el modo de operación.
+        /// Llamarlo con el brazo energizado lo desploma. El sitio correcto es la
+        /// misma ventana de par apagado del cambio de modo: ver
+        /// <see cref="JointController.SetController"/>.</para>
+        ///
+        /// <para>El motor recorta a su propio máximo lo que se le pida de más, así
+        /// que un valor demasiado grande falla del lado seguro —queda en el máximo
+        /// del motor, que es donde ya estaba— y no al revés.</para>
+        ///
+        /// <para>Cada entrada se aplica al motor primario <b>y a su sombra</b>: un
+        /// par dual tiene que tener el mismo techo en los dos o el que lo tenga más
+        /// bajo pelea contra el otro.</para>
+        /// </summary>
+        /// <summary>
+        /// The motors that make up one joint: its primary, plus the shadow that
+        /// doubles it on the shoulder and the elbow. Only motors actually found on
+        /// the bus are returned, so a missing shadow is not an error here.
+        /// </summary>
+        private IEnumerable<byte> MotorsOfJoint(int joint)
+        {
+            byte primary = JointMotorIds[joint];
+            if (_present.Contains(primary)) yield return primary;
+
+            for (int k = 0; k < ShadowMotorIds.Length; k++)
+            {
+                if (ShadowPrimaryIds[k] != primary) continue;
+                if (_present.Contains(ShadowMotorIds[k])) yield return ShadowMotorIds[k];
+            }
+        }
+
+        public bool SetCurrentLimit(double[] milliamps)
+        {
+            if (milliamps.Length != JointCount)
+                return Fail($"SetCurrentLimit espera {JointCount} valores, recibió {milliamps.Length}.");
+
             lock (_io)
             {
                 if (!Ready(out _)) return false;
-                foreach (byte id in _present)
-                {
-                    DynamixelSDK.Write1ByteTxRx(_portNum, DynamixelSDK.PROTOCOL, id,
-                        ControlTable.TorqueEnable, 0);
-                    if (!LastTransactionOk(out string why))
-                        return Fail($"Motor ID {id}: no se pudo apagar el par para el límite de corriente ({why}).");
 
-                    DynamixelSDK.Write2ByteTxRx(_portNum, DynamixelSDK.PROTOCOL, id,
-                        ControlTable.CurrentLimit, (ushort)units);
-                    if (!LastTransactionOk(out string why2))
-                        return Fail($"Motor ID {id}: no se pudo escribir el límite de corriente ({why2}).");
+                for (int i = 0; i < JointMotorIds.Length; i++)
+                {
+                    uint units = (uint)Math.Max(0,
+                        Math.Round(Math.Abs(milliamps[i]) / ControlTable.MilliampsPerCurrentUnit));
+
+                    foreach (byte id in MotorsOfJoint(i))
+                    {
+                        DynamixelSDK.Write1ByteTxRx(_portNum, DynamixelSDK.PROTOCOL, id,
+                            ControlTable.TorqueEnable, 0);
+                        if (!LastTransactionOk(out string why))
+                            return Fail($"Motor ID {id}: no se pudo apagar el par para el límite de corriente ({why}).");
+
+                        DynamixelSDK.Write2ByteTxRx(_portNum, DynamixelSDK.PROTOCOL, id,
+                            ControlTable.CurrentLimit, (ushort)units);
+                        if (!LastTransactionOk(out string why2))
+                            return Fail($"Motor ID {id}: no se pudo escribir el límite de corriente ({why2}).");
+                    }
                 }
+
                 return true;
             }
         }

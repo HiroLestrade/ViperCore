@@ -49,6 +49,11 @@ namespace ViperCore
         private IController? _ctrl;
         private ITrajectory? _traj;
 
+        // The ceiling the installed controller declared, or null when the mode
+        // does not enforce one. Set in SetController, read in the tick.
+        private double[]? _outputLimit;
+        private bool      _limitReported;
+
         private Thread?       _thread;
         private volatile bool _stop;
 
@@ -162,15 +167,38 @@ namespace ViperCore
         /// the mode change has to pass through EEPROM and re-enabling early
         /// would let the arm jump to whatever stale goal the new mode's register
         /// holds.
+        ///
+        /// <para>It is also where <see cref="IController.OutputLimit"/> reaches the
+        /// motors, and that is not a free choice of place: <c>Current Limit</c> is
+        /// an EEPROM register, so writing it needs torque off, and the mode change
+        /// has just turned it off anyway. Doing it anywhere else costs the arm a
+        /// second fall.</para>
         /// </summary>
         public bool SetController(IController controller)
         {
-            _ctrl = controller;
+            _ctrl          = controller;
+            _limitReported = false;
 
-            if (_device.Mode == controller.RequiredMode)
-                return true;
+            // Only kept when the mode actually enforces it. A position
+            // controller's output is degrees, and clamping degrees against a
+            // current ceiling would be nonsense.
+            _outputLimit = controller.RequiredMode == OperatingMode.Current
+                ? controller.OutputLimit
+                : null;
 
-            return _device.SetOperatingMode(controller.RequiredMode);
+            bool modeChanged = _device.Mode != controller.RequiredMode;
+
+            if (modeChanged && !_device.SetOperatingMode(controller.RequiredMode))
+                return false;
+
+            // If the mode did not change, torque may well be on, and SetCurrentLimit
+            // turns it off to write EEPROM and leaves it off. That is a fall, so it
+            // only happens when there is a limit to write — and MoveTo re-energises
+            // through EnableTorqueHolding either way.
+            if (_outputLimit != null && !_device.SetCurrentLimit(_outputLimit))
+                return false;
+
+            return true;
         }
 
         public void SetTrajectory(ITrajectory trajectory) => _traj = trajectory;
@@ -221,12 +249,20 @@ namespace ViperCore
             // gap before the first tick writes a real command. With Profile
             // Velocity at 0 (no limit) that gap is a snap, not a drift.
             //
-            // The non-position modes have no pose to take hold of: they ignore
-            // Goal Position entirely. Energising them on a stale goal is the
-            // same open problem as EmergencyStop outside the position modes.
+            // Current mode goes through the same door: there is no pose to hold
+            // there, but there is a zero, and EnableTorqueHolding writes it before
+            // energising. This used to be a bare EnableTorque, which energised the
+            // arm against whatever Goal Current the register still held from a
+            // previous run — the gap before the first tick, with an unknown
+            // command in it, and the arm already sagging from the mode change.
+            //
+            // Velocity and PWM still do not: neither has a command that means
+            // "stay", so energising there remains the open problem it is in
+            // EmergencyStop.
             bool energised = _device.Mode is OperatingMode.Position or
                                              OperatingMode.ExtendedPosition or
-                                             OperatingMode.CurrentPosition
+                                             OperatingMode.CurrentPosition or
+                                             OperatingMode.Current
                 ? _device.EnableTorqueHolding()
                 : _device.EnableTorque(true);
 
@@ -398,6 +434,8 @@ namespace ViperCore
             if (_ctrl != null) _ctrl.Compute(input, _output);
             else               Array.Copy(_qd, _output, n);
 
+            ClampOutput();
+
             if (!_device.WriteGoals(_output))
                 RaiseFault(_device.LastError ?? "Escritura fallida.");
 
@@ -411,6 +449,60 @@ namespace ViperCore
                 _completed = true;
                 _stop      = true;
             }
+        }
+
+        /// <summary>
+        /// Bounds the controller's output against the ceiling it declared, and
+        /// reports the first time the bound bites.
+        ///
+        /// <para>The motors enforce the same ceiling themselves, so this is not
+        /// what keeps the arm safe — it is what makes a saturation <b>visible</b>.
+        /// The firmware clips without a word, so a model that asks for three times
+        /// what it should and a model that asks for exactly the limit look
+        /// identical from here. One of those is a bug.</para>
+        ///
+        /// <para>NaN is clamped to zero and reported too. It cannot come from a
+        /// correct model, but <c>Encode</c> would turn it into an arbitrary integer
+        /// on its way to a motor, and "arbitrary" is not a current to send an arm.
+        /// Zero is the one value that is always safe to write.</para>
+        /// </summary>
+        private void ClampOutput()
+        {
+            double[]? limit = _outputLimit;
+            if (limit == null) return;
+
+            for (int i = 0; i < _output!.Length && i < limit.Length; i++)
+            {
+                double value = _output[i];
+
+                if (double.IsNaN(value) || double.IsInfinity(value))
+                {
+                    _output[i] = 0.0;
+                    ReportClamp($"El controlador devolvió {value} en la articulación {i + 1}. " +
+                                "Se escribió 0 en su lugar.");
+                    continue;
+                }
+
+                double bound = Math.Abs(limit[i]);
+                if (Math.Abs(value) <= bound) continue;
+
+                _output[i] = value < 0.0 ? -bound : bound;
+                ReportClamp($"La articulación {i + 1} pidió {value:F0} y su tope es " +
+                            $"{bound:F0}. Se recortó; revise el modelo antes de seguir.");
+            }
+        }
+
+        /// <summary>
+        /// Once per motion, not once per tick: at 333 Hz a controller that
+        /// saturates continuously would bury every other fault under thousands of
+        /// copies of the same line.
+        /// </summary>
+        private void ReportClamp(string message)
+        {
+            if (_limitReported) return;
+
+            _limitReported = true;
+            RaiseFault(message);
         }
 
         private void RaiseFault(string message)
