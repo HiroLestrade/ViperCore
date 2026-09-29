@@ -47,15 +47,20 @@ namespace ViperCore
         public const double GripperLength = 0.13658;
 
         /// <summary>
-        /// What is actually mounted: a 62 mm finger in place of the gripper.
+        /// What is actually mounted: a <b>45 mm finger carrying the force
+        /// sensor</b>, in place of the gripper. From the mounting face to the
+        /// fingertip.
         ///
-        /// <para>Change this one constant if the tool changes — it is the only
-        /// thing between the joint angles and where the Cartesian readout says
-        /// the tip is. It is also absent from the dynamic model: the identified
-        /// parameters absorb every centre of mass, so <see cref="L5"/> and the
-        /// tool length affect kinematics only.</para>
+        /// <para>It replaced a plain 62 mm finger, and that is the one number that
+        /// changed: the sensor finger points along z6 like the old one, so nothing
+        /// about the geometry is different except its length.</para>
+        ///
+        /// <para>Change this one constant if the tool changes — it is the only thing
+        /// between the joint angles and where the Cartesian readout says the tip is.
+        /// It is a <b>length</b>, and only that: how much the tool weighs is a
+        /// separate question that this constant has no opinion about.</para>
         /// </summary>
-        public const double FingerLength = 0.062;
+        public const double FingerLength = 0.045;
 
         /// <summary>
         /// Frame-6 origin to the tool tip, along z6 — the article's d6. Frames 4,
@@ -63,13 +68,20 @@ namespace ViperCore
         /// whole end effector, and it is what backs the tip off to the decoupling
         /// point in <see cref="Inverse"/>.
         ///
-        /// <para><b>Measured, not derived.</b> The nominal sum
-        /// <see cref="L5"/> + <see cref="FingerLength"/> is 132 mm; the value used
-        /// is the 130 mm measured on the arm. Those 2 mm are a real difference in
-        /// where this says the tip is, so if the tool is ever re-measured or
-        /// changed, this is the one constant to edit.</para>
+        /// <para><b>Measured, not derived</b>, and re-measured when the tool
+        /// changed. It is 115 mm from the wrist centre to the tip of the 45 mm
+        /// sensor finger — measured on the arm, and equal to the nominal
+        /// <see cref="L5"/> + <see cref="FingerLength"/> to the millimetre. It was
+        /// 130 mm with the previous 62 mm finger.</para>
+        ///
+        /// <para><b>The reference point is the wrist centre, not the mounting
+        /// face.</b> Worth saying because the tool gets specified from the flange:
+        /// a 45 mm finger is a 115 mm tool, not a 45 mm one. Putting the flange
+        /// figure here would move the reported tip 70 mm — the length of
+        /// <see cref="L5"/> — and the error would show up as a Cartesian offset
+        /// that looks like a kinematics problem.</para>
         /// </summary>
-        public const double ToolLength = 0.130;
+        public const double ToolLength = 0.115;
 
         public const int JointCount = 6;
 
